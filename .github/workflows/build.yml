@@ -1,1 +1,104 @@
+name: Build Zokii Chat PKG
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Zokii Chat
+        uses: actions/checkout@v4
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl ca-certificates clang lld cmake ninja-build make python3
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Get current PS4 porting kit
+        run: |
+          git clone --depth 1 https://github.com/orbis-ports/orbis-porting-kit.git porting-kit
+
+      - name: Create a fresh PS4 application project
+        run: |
+          set -eux
+          export OO_PS4_TOOLCHAIN="$GITHUB_WORKSPACE/openorbis"
+
+          # The kit checks the required OpenOrbis SDK and tells us exactly
+          # what is missing instead of silently producing a broken package.
+          porting-kit/scripts/orbis-new.sh --check || true
+
+          # Generate a real C++ PS4 application skeleton.
+          porting-kit/scripts/orbis-new.sh zokii-build --type cpp
+
+          test -f zokii-build/CMakeLists.txt
+          test -f zokii-build/main.cpp
+
+      - name: Download OpenOrbis v0.5.4
+        run: |
+          set -eux
+          mkdir -p openorbis
+          curl -fL --retry 5 --retry-all-errors             -o /tmp/toolchain.tar.gz             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
+          tar -xzf /tmp/toolchain.tar.gz -C openorbis
+          find openorbis -maxdepth 4 -name link.x -print -quit
+
+      - name: Replace generated source with Zokii Chat core
+        run: |
+          set -eux
+          cp src/main.cpp zokii-build/main.cpp
+          cp data/chat.conf zokii-build/chat.conf
+
+      - name: Build PS4 eboot
+        working-directory: zokii-build
+        env:
+          OO_PS4_TOOLCHAIN: ${{ github.workspace }}/openorbis/OpenOrbis/PS4Toolchain
+        run: |
+          set -eux
+          ./build.sh
+
+          test -s eboot.bin || test -s build/eboot.bin
+          find . -type f -name eboot.bin -print
+
+      - name: Locate eboot
+        run: |
+          set -eux
+          EBOOT="$(find zokii-build -type f -name eboot.bin | head -n1)"
+          test -n "$EBOOT"
+          mkdir -p dist
+          cp "$EBOOT" dist/eboot.bin
+          ls -lh dist/eboot.bin
+
+      - name: Build PKG
+        run: |
+          set -eux
+          mkdir -p dist/pkg
+
+          # Use the porting kit's packaging helper when present.
+          if [ -x porting-kit/scripts/ps4/make-pkg.sh ]; then
+            porting-kit/scripts/ps4/make-pkg.sh               --eboot dist/eboot.bin               --out-dir dist/pkg               --title-id ZOKI00001               --title "Zokii Chat"
+          else
+            echo "make-pkg.sh was not found in this kit revision."
+            echo "The eboot was built successfully; packaging needs the kit revision's package helper."
+            exit 1
+          fi
+
+          find dist/pkg -type f -name '*.pkg' -print
+          test -n "$(find dist/pkg -type f -name '*.pkg' -print -quit)"
+
+      - name: Upload PKG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zokii-Chat-PKG
+          path: dist/pkg/*.pkg
+          if-no-files-found: error
